@@ -1,2 +1,0 @@
-"""Operator system source package."""
-
