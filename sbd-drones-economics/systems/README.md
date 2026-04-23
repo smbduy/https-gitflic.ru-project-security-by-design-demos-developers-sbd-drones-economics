@@ -27,7 +27,7 @@
 ### Клон с сабмодулями
 
 ```bash
-git clone --recurse-submodules <url-этого-репозитория>
+cd  <url-этого-репозитория>
 # или после обычного clone:
 git submodule update --init --recursive
 ```
