@@ -203,3 +203,129 @@ def test_housekeeping_loop_integration():
     finally:
         comp._bus.request = original_request
 
+def test_start_stop_lifecycle():
+    """
+    Покрывает: NavigationComponent.start, NavigationComponent.stop
+    """
+    comp, bus = _make_component()
+    
+    # Проверка начального состояния
+    assert comp._running is False
+    
+    # Запуск
+    comp.start()
+    time.sleep(0.3)  # Ждем запуска потока
+    assert comp._running is True
+    
+    # Остановка
+    comp.stop()
+    time.sleep(0.1)  # Ждем завершения потока
+    assert comp._running is False
+
+def test_poll_sitl_once_success():
+    """
+    Покрывает: NavigationComponent._poll_sitl_once, NavigationComponent._publish_nav_state
+    """
+    comp, bus = _make_component()
+    
+    # Данные, которые якобы вернул симулятор
+    mock_data = {
+        "lat": 55.75, "lon": 37.61, "alt": 100.0,
+        "vx": 1.0, "vy": 2.0, "vz": 0.0,
+        "heading": 90.0, "gps_fix_type": 3, "satellites_visible": 10
+    }
+    
+    # Подменяем метод request, чтобы он не ходил в сеть, а возвращал mock_data
+    def mock_request(*args, **kwargs):
+        return {"payload": mock_data}
+    
+    original_req = comp._bus.request
+    comp._bus.request = mock_request
+    
+    try:
+        comp._poll_sitl_once()
+        
+        # 1. Проверка, что внутреннее состояние обновилось
+        assert comp._last_nav_state is not None
+        assert comp._last_nav_state["lat"] == 55.75
+        
+        # 2. Проверка, что данные ушли в шину (опубликовались)
+        nav_topic = config.agrodron_nav_state_topic()
+        published = [m for m in bus.published_messages if m.get("topic") == nav_topic]
+        assert len(published) > 0, "Данные не были опубликованы в шину"
+        
+    finally:
+        comp._bus.request = original_req
+
+def test_poll_sitl_error_handling():
+    """
+    Покрывает: ветку except внутри NavigationComponent._poll_sitl_once
+    """
+    comp, bus = _make_component()
+    
+    # Имитируем ошибку сети
+    def mock_error(*args, **kwargs):
+        raise ConnectionError("SITL unreachable")
+    
+    original_req = comp._bus.request
+    comp._bus.request = mock_error
+    
+    try:
+        # Метод должен поймать ошибку внутри и не упасть
+        comp._poll_sitl_once()
+        # Если дошли сюда — тест пройден (ошибка обработана)
+    except Exception:
+        pytest.fail("Метод _poll_sitl_once не обработал исключение корректно")
+    finally:
+        comp._bus.request = original_req
+
+def test_handle_update_config_full():
+    """
+    Покрывает: NavigationComponent._handle_update_config
+    """
+    comp, bus = _make_component()
+    
+    new_params = {
+        "poll_interval_s": 0.5,
+        "request_timeout_s": 2.0
+    }
+    
+    msg = {"payload": new_params, "sender": config.security_monitor_topic()}
+    result = comp._handle_update_config(msg)
+    
+    assert result is not None
+
+def test_housekeeping_loop_integration():
+    """
+    Покрывает: NavigationComponent._housekeeping_loop (фоновый цикл)
+    Интеграционный тест: запускает поток и ждет публикаций.
+    """
+    comp, bus = _make_component()
+    
+    mock_data = {
+        "lat": 0.0, "lon": 0.0, "alt": 50.0,
+        "gps_fix_type": 3, "heading": 0,
+        "vx": 0, "vy": 0, "vz": 0, "satellites_visible": 4
+    }
+    
+    def mock_request(*args, **kwargs):
+        return {"payload": mock_data}
+    
+    original_req = comp._bus.request
+    comp._bus.request = mock_request
+    
+    try:
+        comp.start()
+        # Ждем 1.5 секунды (стандартный интервал опроса обычно 1с)
+        time.sleep(1.5)
+        comp.stop()
+        time.sleep(0.1)
+        
+        nav_topic = config.agrodron_nav_state_topic()
+        published = [m for m in bus.published_messages if m.get("topic") == nav_topic]
+        
+        assert len(published) >= 1, f"Цикл не отработал ни разу за 1.5 сек. Сообщений: {len(bus.published_messages)}"
+        
+    finally:
+        comp._bus.request = original_req
+
