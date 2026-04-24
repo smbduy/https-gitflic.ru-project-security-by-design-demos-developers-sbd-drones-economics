@@ -41,3 +41,165 @@ def test_nav_state_and_get_state():
     assert state["nav_state"] is not None
     assert state["nav_state"]["lat"] == nav_payload["lat"]
 
+
+def test_lifecycle_start_stop():
+    """
+    НОВЫЙ ТЕСТ: Проверка запуска и остановки компонента.
+    Покрывает методы: start(), stop().
+    """
+    comp = _make_component()
+    
+    # Изначально компонент остановлен
+    assert hasattr(comp, '_running')
+    assert comp._running is False
+    
+    # Запуск компонента
+    comp.start()
+    time.sleep(0.2)  # Даем время на запуск потока
+    
+    assert comp._running is True, "Компонент не перешел в состояние запуска"
+    
+    # Остановка компонента
+    comp.stop()
+    time.sleep(0.1)  # Даем время на завершение потока
+    
+    assert comp._running is False, "Компонент не перешел в состояние остановки"
+
+
+def test_poll_sitl_once_success():
+    """
+    НОВЫЙ ТЕСТ: Проверка успешного однократного опроса SITL.
+    Покрывает методы: _poll_sitl_once(), _publish_nav_state().
+    """
+    comp = _make_component()
+    
+    # Мокированные данные от симулятора
+    mock_sitl_response = {
+        "lat": 55.751244,
+        "lon": 37.618423,
+        "alt": 100.5,
+        "vx": 1.0,
+        "vy": 2.0,
+        "vz": 0.5,
+        "heading": 90.0,
+        "gps_fix_type": 3,
+        "satellites_visible": 10,
+        "timestamp": time.time()
+    }
+    
+    # Подменяем метод request у шины
+    def mock_request(action, target, payload=None, timeout=None):
+        return {"payload": mock_sitl_response, "ok": True}
+    
+    original_request = comp._bus.request
+    comp._bus.request = mock_request
+    
+    try:
+        comp._poll_sitl_once()
+        
+        # 1. Проверяем, что внутреннее состояние обновилось
+        assert comp._last_nav_state is not None
+        assert comp._last_nav_state["lat"] == mock_sitl_response["lat"]
+        
+        # 2. Проверяем публикацию в шину
+        expected_topic = config.agrodron_nav_state_topic()
+        found_publish = False
+        
+        for msg in comp._bus.published_messages:
+            if msg.get("topic") == expected_topic:
+                assert msg["payload"]["lat"] == mock_sitl_response["lat"]
+                found_publish = True
+                break
+        
+        assert found_publish, f"Данные не опубликованы в {expected_topic}"
+        
+    finally:
+        comp._bus.request = original_request
+
+
+def test_poll_sitl_timeout_handling():
+    """
+    НОВЫЙ ТЕСТ: Проверка обработки ошибок при опросе SITL.
+    Покрывает ветки обработки исключений в _poll_sitl_once().
+    """
+    comp = _make_component()
+    
+    def mock_error_request(*args, **kwargs):
+        raise TimeoutError("SITL service unavailable")
+    
+    original_request = comp._bus.request
+    comp._bus.request = mock_error_request
+    
+    try:
+        # Метод должен перехватить исключение внутри себя
+        comp._poll_sitl_once()
+        # Если код дошел сюда - ок
+        assert True 
+    except Exception as e:
+        pytest.fail(f"_poll_sitl_once не обработал исключение: {e}")
+    finally:
+        comp._bus.request = original_request
+
+
+def test_handle_update_config():
+    """
+    НОВЫЙ ТЕСТ: Проверка динамического обновления конфигурации.
+    Покрывает метод: _handle_update_config().
+    """
+    comp = _make_component()
+    
+    new_config_params = {
+        "poll_interval_s": 0.5,
+        "request_timeout_s": 2.0
+    }
+    
+    message = {
+        "payload": new_config_params,
+        "sender": SM_TOPIC
+    }
+    
+    result = comp._handle_update_config(message)
+    
+    assert result is not None, "Обработчик должен возвращать результат"
+
+
+def test_housekeeping_loop_integration():
+    """
+    НОВЫЙ ИНТЕГРАЦИОННЫЙ ТЕСТ: Проверка работы фонового цикла.
+    Покрывает метод: _housekeeping_loop().
+    """
+    comp = _make_component()
+    
+    mock_response_data = {
+        "lat": 55.0,
+        "lon": 37.0,
+        "alt": 50.0,
+        "gps_fix_type": 3,
+        "heading": 180.0,
+        "vx": 0.0, "vy": 0.0, "vz": 0.0,
+        "satellites_visible": 8
+    }
+    
+    def static_mock_request(*args, **kwargs):
+        return {"payload": mock_response_data, "ok": True}
+    
+    original_request = comp._bus.request
+    comp._bus.request = static_mock_request
+    
+    try:
+        comp.start()
+        time.sleep(2.5)  # Ждем 2-3 цикла опроса
+        comp.stop()
+        time.sleep(0.1)
+        
+        expected_topic = config.agrodron_nav_state_topic()
+        nav_messages = [
+            m for m in comp._bus.published_messages 
+            if m.get("topic") == expected_topic
+        ]
+        
+        assert len(nav_messages) > 0, "Цикл не опубликовал данные навигации"
+        
+    finally:
+        comp._bus.request = original_request
+
