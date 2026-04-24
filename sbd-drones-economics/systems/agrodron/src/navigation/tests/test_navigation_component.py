@@ -1,6 +1,7 @@
 from systems.agrodron.src.bus_mock import MockSystemBus
 from systems.agrodron.src.navigation import config
 from systems.agrodron.src.navigation.src.navigation import NavigationComponent
+import time
 
 SM_TOPIC = config.security_monitor_topic()
 
