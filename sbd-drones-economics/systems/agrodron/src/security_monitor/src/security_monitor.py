@@ -4,6 +4,7 @@ SecurityMonitorComponent - компонент-монитор безопасно�
 import json
 import logging
 import os
+import time
 from typing import Dict, Any, Tuple, Set, Optional
 
 from sdk.base_component import BaseComponent
@@ -44,6 +45,7 @@ class SecurityMonitorComponent(BaseComponent):
             )
         self._policies: Set[PolicyKey] = self._parse_policies(raw_policies)
         self._mode: str = "NORMAL"  # NORMAL | ISOLATED
+        self._ready: bool = False
 
         # Диагностика загрузки политик (при 0 политик — проверить SECURITY_POLICIES в контейнере)
         n = len(self._policies)
@@ -72,6 +74,66 @@ class SecurityMonitorComponent(BaseComponent):
         self.register_handler("list_policies", self._handle_list_policies)
         self.register_handler("isolation_start", self._handle_isolation_start)
         self.register_handler("isolation_status", self._handle_isolation_status)
+
+    def start(self) -> None:
+        super().start()
+        self._ready = self._warm_up_subscription()
+
+    def _handle_get_status(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        status = super()._handle_get_status(message)
+        status.update(
+            {
+                "ready": self._ready,
+                "mode": self._mode,
+                "policies_count": len(self._policies),
+            }
+        )
+        return status
+
+    def _warm_up_subscription(self) -> bool:
+        warmup_s = config.subscribe_warmup_s()
+        if warmup_s <= 0:
+            logger.info("[%s] subscribe warmup disabled", self.component_id)
+            return True
+
+        deadline = time.monotonic() + warmup_s
+        probe_timeout_s = config.startup_probe_timeout_s()
+        attempts = 0
+
+        while True:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                break
+
+            attempts += 1
+            try:
+                response = self.bus.request(
+                    self.topic,
+                    {"action": "ping", "sender": self.topic},
+                    timeout=min(probe_timeout_s, remaining_s),
+                )
+                payload = response.get("payload") if isinstance(response, dict) else None
+                if isinstance(payload, dict) and payload.get("pong") is True:
+                    logger.info(
+                        "[%s] subscribe warmup ready after %d probe(s)",
+                        self.component_id,
+                        attempts,
+                    )
+                    return True
+            except Exception as exc:
+                logger.debug("[%s] subscribe warmup probe failed: %s", self.component_id, exc)
+
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                break
+            time.sleep(min(0.1, remaining_s))
+
+        logger.warning(
+            "[%s] subscribe warmup did not confirm readiness after %.1fs; continuing",
+            self.component_id,
+            warmup_s,
+        )
+        return False
 
     def _log_component_started(self) -> None:
         """Журнал принимает log_event только от топика МБ — публикуем напрямую."""

@@ -138,7 +138,7 @@ class NavigationComponent(BaseComponent):
             "payload": {
                 "target": {
                     "topic": config.sitl_telemetry_request_topic(),
-                    "action": "__raw__",
+                    "action": "request_position",
                 },
                 # Схема SITL: sitl-position-request.json — drone_id строка, pattern ^drone_[0-9]{3,4}$
                 "data": {"drone_id": str(drone_id)} if drone_id else {},

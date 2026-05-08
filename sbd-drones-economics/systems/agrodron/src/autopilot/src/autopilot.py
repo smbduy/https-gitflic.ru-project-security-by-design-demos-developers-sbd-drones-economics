@@ -4,10 +4,9 @@ import threading
 import time
 from sdk.base_component import BaseComponent
 from broker.system_bus import SystemBus
+from systems.agrodron.src.autopilot import config
 from systems.agrodron.scripts.proxy_reply import extract_navigation_nav_state_from_target_response
 from systems.agrodron.scripts.proxy_reply import unwrap_proxy_target_response
-
-from systems.agrodron.src.autopilot import config
 
 
 class AutopilotComponent(BaseComponent):
@@ -27,8 +26,11 @@ class AutopilotComponent(BaseComponent):
         topic: str = "",
     ):
         self._mission: Optional[Dict[str, Any]] = None
+        self._mission_condition = threading.Condition()
         self._state: str = "IDLE"
         self._current_step_index: Optional[int] = None
+        self._preflight_passed: bool = False
+        self._last_error: Optional[str] = None
         self._last_nav_state: Optional[Dict[str, Any]] = None
         self._sprayer_state: str = "OFF"
 
@@ -44,6 +46,7 @@ class AutopilotComponent(BaseComponent):
         self._control_interval_s: float = config.autopilot_control_interval_s()
         self._nav_poll_interval_s: float = config.autopilot_nav_poll_interval_s()
         self._request_timeout_s: float = config.autopilot_request_timeout_s()
+        self._start_mission_wait_s: float = config.autopilot_start_mission_wait_s()
         self._last_nav_poll_ts: float = 0.0
 
         super().__init__(
@@ -93,9 +96,11 @@ class AutopilotComponent(BaseComponent):
         if not isinstance(mission, dict):
             return {"ok": False, "error": "invalid_mission"}
 
-        self._mission = mission
-        self._current_step_index = 0 if mission.get("steps") else None
-        self._state = "MISSION_LOADED"
+        with self._mission_condition:
+            self._mission = mission
+            self._current_step_index = 0 if mission.get("steps") else None
+            self._state = "MISSION_LOADED"
+            self._mission_condition.notify_all()
         self._log_to_journal("AUTOPILOT_MISSION_LOADED", {"mission_id": mission.get("mission_id"), "state": self._state})
         return {"ok": True, "state": self._state}
 
@@ -108,24 +113,19 @@ class AutopilotComponent(BaseComponent):
         old_state = self._state
 
         if command == "START":
-            if self._mission is None:
-                return {"ok": False, "error": "no_mission"}
+            if self._mission is None and not self._wait_for_mission_before_start():
+                return {
+                    "ok": False,
+                    "error": "no_mission",
+                    "waited_s": self._start_mission_wait_s,
+                }
             if self._state not in ("MISSION_LOADED", "IDLE"):
                 return {"ok": False, "error": "invalid_state_for_start", "state": self._state}
 
-            mission_id = self._mission.get("mission_id", "")
-
-            orvd_ok = self._request_departure_orvd(mission_id)
-            if not orvd_ok:
-                self._notify_nus("mission_rejected", {"reason": "orvd_denied", "mission_id": mission_id})
-                return {"ok": False, "error": "orvd_departure_denied"}
-
-            dp_ok = self._request_takeoff_droneport(mission_id)
-            if not dp_ok:
-                self._notify_nus("mission_rejected", {"reason": "droneport_denied", "mission_id": mission_id})
-                return {"ok": False, "error": "droneport_takeoff_denied"}
-
-            self._state = "EXECUTING"
+            # Возвращаем промежуточный статус. НУС поймет, что мы готовимся.
+            self._state = "PRE_FLIGHT"
+            self._log_to_journal("AUTOPILOT_START_ACCEPTED", {"mission_id": self._mission.get("mission_id"), "state": self._state})
+            return {"ok": True, "state": "PRE_FLIGHT"}
         elif command == "PAUSE":
             if self._state == "EXECUTING":
                 self._state = "PAUSED"
@@ -158,6 +158,21 @@ class AutopilotComponent(BaseComponent):
             self._log_to_journal("AUTOPILOT_STATE_CHANGE", {"old_state": old_state, "new_state": self._state, "command": command})
         return {"ok": True, "state": self._state}
 
+    def _wait_for_mission_before_start(self) -> bool:
+        """START может прийти чуть раньше mission_load; ждём короткое окно."""
+        timeout_s = self._start_mission_wait_s
+        if timeout_s <= 0:
+            return self._mission is not None
+
+        deadline = time.monotonic() + timeout_s
+        with self._mission_condition:
+            while self._mission is None:
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0:
+                    return False
+                self._mission_condition.wait(timeout=remaining_s)
+            return True
+
     def _handle_get_state(self, message: Dict[str, Any]) -> Dict[str, Any]:
         # Запрос состояния может приходить от любых отправителей через монитор.
         steps = self._mission.get("steps") if isinstance(self._mission, dict) else None
@@ -165,6 +180,7 @@ class AutopilotComponent(BaseComponent):
 
         return {
             "state": self._state,
+            "last_error": self._last_error,
             "mission_id": self._mission.get("mission_id") if self._mission else None,
             "current_step_index": self._current_step_index,
             "total_steps": total_steps,
@@ -176,6 +192,8 @@ class AutopilotComponent(BaseComponent):
 
     def _control_loop(self) -> None:
         """Простейший управляющий цикл автопилота."""
+        # Даём шине и основному потоку потребителя немного времени на прогрев
+        time.sleep(2.0)
         while self._running:
             try:
                 self._poll_navigation_if_due()
@@ -213,6 +231,27 @@ class AutopilotComponent(BaseComponent):
 
     def _step_control(self) -> None:
         if self._last_nav_state is None:
+            return
+
+        if self._state == "PRE_FLIGHT":
+            mission_id = self._mission.get("mission_id", "") if self._mission else "unknown"
+            self._last_error = None # Сбрасываем старую ошибку при новой попытке
+            
+            # 1. Проверка ОРВД
+            if not self._request_departure_orvd(mission_id):
+                self._state = "ABORTED"
+                self._last_error = "orvd_denied"
+                return
+
+            # 2. Проверка Дронопорта
+            if not self._request_takeoff_droneport(mission_id):
+                self._state = "ABORTED"
+                self._last_error = "droneport_denied"
+                return
+
+            # Всё отлично, взлетаем!
+            self._state = "EXECUTING"
+            self._log_to_journal("AUTOPILOT_PREFLIGHT_PASSED", {"mission_id": mission_id})
             return
 
         if self._landing_active:
@@ -422,6 +461,16 @@ class AutopilotComponent(BaseComponent):
 
     # ------------------------------------------------ external system requests
 
+    @staticmethod
+    def _unwrap_proxy_target_response(response: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        target_response = unwrap_proxy_target_response(response)
+        if target_response is None:
+            return response if isinstance(response, dict) else None
+        target_payload = target_response.get("payload")
+        if isinstance(target_payload, dict):
+            return target_payload
+        return target_response
+
     def _proxy_request_external(self, topic: str, action: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not topic:
             return None
@@ -440,7 +489,7 @@ class AutopilotComponent(BaseComponent):
         )
         if not isinstance(response, dict):
             return None
-        return response.get("target_response") or response
+        return self._unwrap_proxy_target_response(response)
 
     def _request_departure_orvd(self, mission_id: str) -> bool:
         topic = config.orvd_topic()
@@ -534,9 +583,6 @@ class AutopilotComponent(BaseComponent):
             "request_takeoff",
             {
                 "drone_id": config.orvd_drone_id(),
-                "battery": self._droneport_battery_pct(
-                    default=config.droneport_takeoff_battery_default(),
-                ),
             },
         )
         if self._droneport_takeoff_ok(resp):
@@ -557,6 +603,9 @@ class AutopilotComponent(BaseComponent):
             {
                 "drone_id": config.orvd_drone_id(),
                 "model": config.droneport_drone_model(),
+                "battery": self._droneport_battery_pct(
+                    default=config.droneport_landing_battery_default(),
+                ),
             },
         )
         ok = self._droneport_landing_ok(resp)
@@ -683,5 +732,3 @@ class AutopilotComponent(BaseComponent):
             self._log_to_journal("DRONEPORT_CHARGING_REQUESTED", {"response": resp})
         else:
             self._log_to_journal("DRONEPORT_CHARGING_REQUEST_FAILED", {"response": resp})
-
-

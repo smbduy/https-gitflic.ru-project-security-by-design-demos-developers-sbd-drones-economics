@@ -36,7 +36,11 @@ def autopilot_nav_poll_interval_s() -> float:
 
 
 def autopilot_request_timeout_s() -> float:
-    return _get_float("AUTOPILOT_REQUEST_TIMEOUT_S", 2.0, min_value=0.1)
+    return _get_float("AUTOPILOT_REQUEST_TIMEOUT_S", 5.0, min_value=0.1)
+
+
+def autopilot_start_mission_wait_s() -> float:
+    return _get_float("AUTOPILOT_START_MISSION_WAIT_S", 3.0, min_value=0.0)
 
 
 def navigation_get_state_action() -> str:
@@ -83,11 +87,10 @@ def droneport_charging_battery_default() -> float:
     return _get_float("DRONEPORT_CHARGING_BATTERY_DEFAULT", 50.0, min_value=0.0)
 
 
-def droneport_takeoff_battery_default() -> float:
-    """Значение заряда (%) в `request_takeoff`, если в навигации нет батареи. DronePort требует > 80."""
-    return _get_float("DRONEPORT_TAKEOFF_BATTERY_DEFAULT", 95.0, min_value=0.0)
+def droneport_landing_battery_default() -> float:
+    """Значение заряда (%) в `request_landing`, если в навигации нет батареи."""
+    return _get_float("DRONEPORT_LANDING_BATTERY_DEFAULT", 95.0, min_value=0.0)
 
 
 def sitl_topic() -> str:
     return (os.environ.get("SITL_TOPIC") or "").strip()
-
